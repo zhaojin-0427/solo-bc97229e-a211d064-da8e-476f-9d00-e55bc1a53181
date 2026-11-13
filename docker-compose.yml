@@ -1,0 +1,27 @@
+services:
+  ctms-check:
+    build: .
+    image: ctms-sql-check:1.0.0
+    container_name: ctms-sql-check
+    ports:
+      - "8000:8000"
+    environment:
+      # 每条规则的计算时限（秒），到点 interrupt 真正停止计算
+      QUERY_TIMEOUT_SECONDS: "5"
+      SAMPLE_ROW_LIMIT: "20"
+      MAX_RULES_PER_BATCH: "100"
+      MAX_UPLOAD_BYTES: "209715200"
+      DATA_DIR: "/data"
+    volumes:
+      # 报告控制库与上传副本持久化：重启后完整报告保留，未完成批次标中断
+      - ctms-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  ctms-data:

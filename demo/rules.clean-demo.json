@@ -1,0 +1,1 @@
+[{"name": "all_subjects_have_visits", "sql": "SELECT s.id FROM subjects s LEFT JOIN visits v ON v.subject_id = s.id GROUP BY s.id HAVING COUNT(v.id) = 0"}, {"name": "no_orphan_visits", "sql": "SELECT v.id FROM visits v LEFT JOIN subjects s ON s.id = v.subject_id WHERE s.id IS NULL"}]

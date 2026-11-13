@@ -1,0 +1,26 @@
+[
+  {
+    "name": "subject_missing_visits",
+    "sql": "SELECT s.id AS subject_id, s.enrolled_on FROM subjects s LEFT JOIN visits v ON v.subject_id = s.id WHERE v.id IS NULL"
+  },
+  {
+    "name": "visit_before_enrollment",
+    "sql": "SELECT v.id AS visit_id, v.subject_id, v.visited_on, s.enrolled_on FROM visits v JOIN subjects s ON s.id = v.subject_id WHERE s.enrolled_on IS NOT NULL AND v.visited_on < s.enrolled_on"
+  },
+  {
+    "name": "visit_without_enrollment",
+    "sql": "SELECT v.id AS visit_id, v.subject_id, v.visited_on FROM visits v JOIN subjects s ON s.id = v.subject_id WHERE s.enrolled_on IS NULL"
+  },
+  {
+    "name": "duplicate_visit_same_day",
+    "sql": "SELECT subject_id, visited_on, COUNT(*) AS cnt FROM visits GROUP BY subject_id, visited_on HAVING COUNT(*) > 1"
+  },
+  {
+    "name": "orphan_visit_subject_missing",
+    "sql": "SELECT v.id AS visit_id, v.subject_id, v.visited_on FROM visits v LEFT JOIN subjects s ON s.id = v.subject_id WHERE s.id IS NULL"
+  },
+  {
+    "name": "slow_query_timeout_demo",
+    "sql": "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 1000000000) SELECT x FROM cnt"
+  }
+]

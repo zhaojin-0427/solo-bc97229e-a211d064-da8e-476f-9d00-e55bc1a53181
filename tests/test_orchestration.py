@@ -2,6 +2,10 @@
 """端到端编排测试（标准库）：绕过 HTTP 层，直接驱动 storage + runner。
 
 运行： python -I tests/test_orchestration.py
+
+覆盖：完整批次裁决、超时继续同批后续规则、取消整批、并发批次互不阻塞、
+重启恢复，以及长文本 GLOB 卡死回归（超时被 SIGKILL 停止、同批后续规则
+不等待、取消只终止本批次、并发快批次不受影响）。
 """
 from __future__ import annotations
 
@@ -46,11 +50,22 @@ def make_db(path: Path, mode: str) -> Path:
     if mode == "dirty":
         # 访视早于入组 -> 必有违规
         conn.execute("INSERT INTO visits(subject_id, visited_on) VALUES ('S1','2025-01-01')")
+    elif mode == "glob":
+        # 长文本 GLOB 卡点：50 万个 a；模式为 星号+2 万个 a+b（自然匹配约 22 秒）
+        conn.execute("INSERT INTO subjects VALUES ('LONG', ?)", ("a" * 500_000,))
+        conn.execute("INSERT INTO visits(subject_id, visited_on) VALUES ('S1','2026-02-01')")
     else:
         conn.execute("INSERT INTO visits(subject_id, visited_on) VALUES ('S1','2026-02-01')")
     conn.commit()
     conn.close()
     return path
+
+
+GLOB_STALL_SQL = (
+    "SELECT id FROM subjects WHERE enrolled_on GLOB '*"
+    + "a" * 20_000
+    + "b'"
+)
 
 
 def wait_terminal(bid: str, timeout: float = 20.0) -> str:
@@ -142,6 +157,53 @@ def main() -> int:
     check(time.monotonic() - t0 < 3, "快批次未被慢批次阻塞（并行生效）")
     check(wait_terminal(bx, timeout=10) == storage.BATCH_COMPLETED, "慢批次随后完成")
     check(storage.get_rule_rows(bx)[0]["status"] == storage.RULE_TIMEOUT, "慢批次规则 timeout")
+    runner.QUERY_TIMEOUT_SECONDS = 5
+
+    print("== 回归：GLOB 卡死批次超时后被 SIGKILL，同批后续规则立即继续 ==")
+    db_glob = make_db(_TMP / "glob.db", "glob")
+    glob_slow = [{"name": "glob_stall", "sql": GLOB_STALL_SQL}]
+    b7 = "e2e-glob-timeout"
+    storage.insert_batch(b7, "glob-timeout", "glob.db", str(db_glob),
+                         glob_slow + good_rule)
+    runner.QUERY_TIMEOUT_SECONDS = 2
+    t0 = time.monotonic()
+    runner.submit_batch(b7)
+    check(wait_terminal(b7, timeout=20) == storage.BATCH_COMPLETED,
+          "含 GLOB 卡死规则的批次仍能走完裁决")
+    dt = time.monotonic() - t0
+    rules = storage.get_rule_rows(b7)
+    check(rules[0]["status"] == storage.RULE_TIMEOUT,
+          f"GLOB 规则 timeout（实际 {rules[0]['status']}）")
+    check(rules[0]["violation_count"] is None, "超时规则无违规计数，不放行")
+    check(rules[1]["status"] == storage.RULE_PASSED,
+          f"同批后续规则未被拖住，正常 passed（实际 {rules[1]['status']}）")
+    # 若未真正杀死子进程，批次至少要拖到 GLOB 自然结束（约 22 秒）
+    check(dt < 12, f"批次总耗时 {dt:.1f}s，远小于 GLOB 自然完成时间")
+
+    print("== 回归：取消 GLOB 批次只终止本批，且并发快批次不受影响 ==")
+    b8, b9 = "e2e-glob-cancel", "e2e-glob-fast"
+    storage.insert_batch(b8, "glob-cancel", "glob.db", str(db_glob),
+                         glob_slow + good_rule)
+    storage.insert_batch(b9, "fast", "clean.db", str(db_clean), good_rule)
+    runner.QUERY_TIMEOUT_SECONDS = 60  # 慢批次预算拉长，取消必须先到
+    t0 = time.monotonic()
+    runner.submit_batch(b8)
+    runner.submit_batch(b9)
+    time.sleep(0.8)  # 确保 GLOB 子进程已在内置函数里空转
+    check(runner.request_cancel(b8) is True, "取消信号送达 GLOB 批次")
+    check(wait_terminal(b8, timeout=10) == storage.BATCH_CANCELLED,
+          "GLOB 批次终态 cancelled")
+    cancel_dt = time.monotonic() - t0
+    check(cancel_dt < 8, f"取消后 {cancel_dt:.1f}s 内终态（未等 GLOB 自然结束）")
+    rules = storage.get_rule_rows(b8)
+    check(rules[0]["status"] == storage.RULE_CANCELLED,
+          f"被卡住的 GLOB 规则标记 cancelled（实际 {rules[0]['status']}）")
+    check(all(r["status"] != storage.RULE_PASSED for r in rules),
+          "取消批次不出现任何通过结论（不可放行）")
+    check(wait_terminal(b9, timeout=10) == storage.BATCH_COMPLETED,
+          "并发快批次正常完成，未被取消波及")
+    check(storage.get_rule_rows(b9)[0]["status"] == storage.RULE_PASSED,
+          "快批次规则 passed（其他批次不被终止）")
     runner.QUERY_TIMEOUT_SECONDS = 5
 
     print("== 重启恢复：running 批次 -> interrupted，报告保留 ==")

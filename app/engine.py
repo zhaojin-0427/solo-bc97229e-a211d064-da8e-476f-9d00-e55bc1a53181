@@ -2,24 +2,37 @@
 
 关键语义：
 1. 上传库始终以 ``mode=ro`` 只读 URI 打开，核查 SQL 无法修改上传库；
-2. 每条规则共享一个 5 秒预算；看门狗线程到点调用 ``conn.interrupt()``
-   让 SQLite 虚拟机真正中止计算（而不是仅在客户端放弃结果）；
-3. 取消通过 threading.Event 触发同一套中断机制，并由 progress handler
-   在虚拟机内部协作式快速退出；
-4. 超时 / 取消 / 出错都不产生“通过”结论。
+2. 每条规则在**独立子进程**中执行（计数 + 前 N 行取样共享同一 deadline）。
+   时限到期或收到取消时，父进程直接向子进程发 SIGKILL——
+   SQLite 内置函数（如长文本 GLOB/LIKE 匹配）执行期间，
+   ``sqlite3_interrupt()`` 与 progress handler 都要等当前虚拟机指令返回
+   才生效，单条 GLOB 调用可能卡住几十秒且无法中止；只有进程级终止
+   才能立刻停止实际计算，并由操作系统回收 CPU / 内存；
+3. 超时记 ``timeout``、取消记 ``cancelled``，两者都不产生"通过"结论
+   （fail-closed），且父进程回收子进程后同批后续规则立即继续。
 """
 from __future__ import annotations
 
+import json
+import os
 import sqlite3
+import subprocess
+import sys
+import tempfile
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import quote
 
 from . import storage
 from .config import QUERY_TIMEOUT_SECONDS, SAMPLE_ROW_LIMIT
+
+# 看门狗轮询间隔：取消 / 超时的响应粒度（秒）
+_POLL_INTERVAL_SECONDS = 0.05
+# SIGKILL 后等待子进程回收的上限（秒）；SIGKILL 正常即刻生效，这只是兜底
+_KILL_GRACE_SECONDS = 5.0
 
 
 @dataclass
@@ -33,25 +46,6 @@ class RuleOutcome:
     elapsed_ms: int = 0
     timed_out: bool = False
     cancelled: bool = False
-
-
-@dataclass
-class _WatchResult:
-    reason: Optional[str] = None  # None=正常结束；"timeout" / "cancelled"
-
-
-@dataclass
-class _WorkerBundle:
-    """工作线程与看门狗之间的共享状态。"""
-
-    cancel_event: threading.Event
-    conn: sqlite3.Connection
-    deadline: float
-    result: _WatchResult = field(default_factory=_WatchResult)
-    state_lock: threading.Lock = field(default_factory=threading.Lock)
-    finished: bool = False
-    # 工作线程正常完成时写入 (违规总数, 前 N 行明细)
-    normal_payload: Optional[tuple[int, list[dict[str, Any]]]] = None
 
 
 def open_readonly_connection(db_path: str | Path) -> sqlite3.Connection:
@@ -86,7 +80,7 @@ def build_sample_sql(sql: str, limit: int) -> str:
     return f"SELECT * FROM ({strip_trailing_semicolon(sql)}) LIMIT {int(limit)}"
 
 
-def _rows_to_dicts(cursor: sqlite3.Cursor, rows: list[tuple]) -> list[dict[str, Any]]:
+def rows_to_dicts(cursor: sqlite3.Cursor, rows: list[tuple]) -> list[dict[str, Any]]:
     columns = [d[0] for d in cursor.description] if cursor.description else []
     result: list[dict[str, Any]] = []
     for row in rows:
@@ -108,70 +102,126 @@ def _json_safe(value: Any) -> Any:
     return str(value)
 
 
-def _make_progress_handler(bundle: _WorkerBundle):
-    """SQLite 虚拟机进度回调：每 ~1000 个字节码指令调用一次。
+# ---------------- 子进程工作器 ----------------
+#
+# 为什么必须用子进程而不是线程 + conn.interrupt()：
+# SQLite 的中断标志与 progress handler 都只在**虚拟机指令之间**检查。
+# 递归 CTE 这类"指令流"查询可以被 interrupt 中止；但长文本 GLOB/LIKE
+# 匹配是**单条内置函数调用**（实测 50 万字符文本 × 2 万字符模式要约 22 秒），
+# 期间 interrupt() 和 progress handler 完全失效，线程又无法被外部杀死，
+# 结果就是"取消也无法停止、同批后续规则一直等待"。
+# 把规则放进独立子进程后，父进程可用 SIGKILL 立即终止计算并由 OS 回收资源。
 
-    返回非零会让 SQLite 中止当前语句并抛 OperationalError(interrupted)。
-    这让取消在长查询内部也能快速生效，不必等到看门狗超时。
+
+def _package_root() -> Path:
+    """app 包的父目录，用于子进程 PYTHONPATH。"""
+    return Path(__file__).resolve().parent.parent
+
+
+def _worker_env() -> dict[str, str]:
+    """子进程环境：注入包路径，保证 ``python -m app._worker`` 可导入。
+
+    不能用 ``-I``（隔离模式隐含 -E，会忽略 PYTHONPATH），因此改用
+    ``-P -s`` 并显式重建 PYTHONPATH；同时保留 DATA_DIR 等运行配置
+    （子进程只用到只读打开逻辑）。
     """
-
-    def handler() -> int:
-        if bundle.cancel_event.is_set():
-            with bundle.state_lock:
-                if not bundle.finished:
-                    bundle.result.reason = "cancelled"
-            return 1
-        remaining = bundle.deadline - time.monotonic()
-        if remaining <= 0:
-            with bundle.state_lock:
-                if not bundle.finished:
-                    bundle.result.reason = "timeout"
-            return 1
-        return 0
-
-    return handler
+    env = dict(os.environ)
+    root = str(_package_root())
+    existing = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = root if not existing else root + os.pathsep + existing
+    return env
 
 
-def _watchdog(bundle: _WorkerBundle, worker: threading.Thread) -> None:
-    """看门狗：到 deadline 或收到取消时，对连接执行 interrupt。
+def _worker_command(job_path: str) -> list[str]:
+    return [
+        sys.executable,
+        "-P",  # 不把 cwd / 脚本目录放进 sys.path，避免上传目录同名模块被导入
+        "-s",  # 不加载用户 site-packages
+        "-m",
+        "app._worker",
+        job_path,
+    ]
 
-    interrupt 是 SQLite 官方提供的异步取消入口，可从其它线程安全调用，
-    会让正在执行的语句尽快终止——这是“停止实际计算”的关键。
+
+def _write_job_file(job: dict[str, Any]) -> str:
+    """把任务参数写入临时 JSON 文件（0600），路径经 argv 传给子进程。
+
+    不用 stdin 传参：SQL 文本可能超过管道缓冲（64KB），
+    communicate 超时重试不会续写未发完的 input，会造成假超时。
     """
-    while True:
-        if worker.is_alive() is False:
-            return
-        remaining = bundle.deadline - time.monotonic()
-        if remaining <= 0:
-            with bundle.state_lock:
-                if not bundle.finished:
-                    bundle.result.reason = "timeout"
-            _safe_interrupt(bundle)
-            return
-        # 最多每 50ms 醒一次，兼顾取消响应速度与 CPU 开销
-        if bundle.cancel_event.wait(timeout=min(0.05, max(remaining, 0.0))):
-            with bundle.state_lock:
-                if not bundle.finished:
-                    bundle.result.reason = "cancelled"
-            _safe_interrupt(bundle)
-            return
-
-
-def _safe_interrupt(bundle: _WorkerBundle) -> None:
+    fd, path = tempfile.mkstemp(prefix="ctms-rule-job-", suffix=".json")
     try:
-        bundle.conn.interrupt()
-    except sqlite3.Error:
-        # 连接已关闭等竞态：工作线程马上也会结束，忽略即可
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(job, fh, ensure_ascii=False)
+    except Exception:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def _remove_quietly(path: Optional[str]) -> None:
+    if not path:
+        return
+    try:
+        os.unlink(path)
+    except OSError:
         pass
 
 
-def _classify_interrupt_error(bundle: _WorkerBundle) -> str:
-    """根据看门狗 / 回调记录的原因判定中断类型。"""
-    with bundle.state_lock:
-        reason = bundle.result.reason
-    if reason == "cancelled" or bundle.cancel_event.is_set():
-        return storage.RULE_CANCELLED
-    return storage.RULE_TIMEOUT  # reason == "timeout" 或竞态下的保守判定
+# Linux 上让子进程在父进程死亡时收到 SIGKILL（PR_SET_PDEATHSIG），
+# 防止服务重启后遗留孤儿进程继续烧 CPU；libc 句柄在父进程提前打开，
+# 避免 fork 后的子进程里再走 dlopen。
+_PDEATHSIG_LIBC: Any = None
+if sys.platform.startswith("linux"):
+    try:
+        import ctypes
+
+        _PDEATHSIG_LIBC = ctypes.CDLL("libc.so.6", use_errno=True)
+    except Exception:  # pragma: no cover - 极端环境无 libc 时降级
+        _PDEATHSIG_LIBC = None
+
+
+def _child_set_pdeathsig() -> None:
+    """preexec_fn：子进程 exec 前设置父亡信号；失败不影响主流程。"""
+    if _PDEATHSIG_LIBC is None:
+        return
+    try:
+        _PDEATHSIG_LIBC.prctl(1, 9, 0, 0, 0)  # PR_SET_PDEATHSIG, SIGKILL
+    except Exception:
+        pass
+
+
+def _spawn_worker(job_path: str) -> subprocess.Popen:
+    kwargs: dict[str, Any] = dict(
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,  # 独立会话，信号语义干净
+        env=_worker_env(),
+    )
+    if _PDEATHSIG_LIBC is not None:
+        kwargs["preexec_fn"] = _child_set_pdeathsig
+    return subprocess.Popen(_worker_command(job_path), **kwargs)
+
+
+def _kill_and_reap(proc: subprocess.Popen) -> None:
+    """SIGKILL 子进程并回收：等退出、读干管道，确保计算停止、资源回收。"""
+    try:
+        proc.kill()
+    except OSError:
+        pass  # 进程已退出（竞态），直接走回收
+    try:
+        # communicate 在 TimeoutExpired 后重试是文档允许的安全操作，
+        # 这里进程尚未完成过一次成功的 communicate，直接调用即可。
+        proc.communicate(timeout=_KILL_GRACE_SECONDS)
+    except Exception:
+        try:
+            proc.wait(timeout=1.0)
+        except Exception:
+            pass
 
 
 def execute_rule(
@@ -183,127 +233,139 @@ def execute_rule(
 ) -> RuleOutcome:
     """执行一条核查规则，返回结构化结论。
 
-    预算说明：计数查询与取前 N 行查询共享同一个 deadline（共 timeout_seconds
-    秒），保证“每条查询限 5 秒、超时停止实际计算”。
+    预算说明：子进程启动、计数查询与取前 N 行查询共享同一个 deadline
+    （共 timeout_seconds 秒）。到点或收到取消即 SIGKILL 子进程，
+    停止实际计算并回收资源，不等待 SQLite 内置函数自然结束。
     """
     started = time.monotonic()
     deadline = started + timeout_seconds
-    conn: Optional[sqlite3.Connection] = None
+    job = {
+        "db_path": str(Path(db_path).resolve()),
+        "count_sql": build_count_sql(sql_text),
+        "sample_sql": build_sample_sql(sql_text, sample_limit),
+        # 兜底自毁时限：父进程异常消失时，子进程也不无限运行
+        "self_destruct_seconds": timeout_seconds + 2.0,
+    }
+    try:
+        job_path = _write_job_file(job)
+    except OSError as exc:
+        return RuleOutcome(
+            status=storage.RULE_ERROR,
+            error_message=f"无法创建规则任务文件: {exc}",
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+        )
+
+    proc: Optional[subprocess.Popen] = None
     try:
         try:
-            conn = open_readonly_connection(db_path)
-        except sqlite3.Error as exc:
+            proc = _spawn_worker(job_path)
+        except OSError as exc:
             return RuleOutcome(
                 status=storage.RULE_ERROR,
-                error_message=f"无法只读打开上传库: {type(exc).__name__}: {exc}",
+                error_message=f"无法启动规则工作进程: {exc}",
                 elapsed_ms=int((time.monotonic() - started) * 1000),
             )
-        bundle = _WorkerBundle(
-            cancel_event=cancel_event,
-            conn=conn,
-            deadline=deadline,
-        )
-        conn.set_progress_handler(_make_progress_handler(bundle), 1000)
 
-        worker_error: list[BaseException] = []
-
-        def worker() -> None:
+        reason: Optional[str] = None  # "timeout" / "cancelled"
+        out_bytes: bytes = b""
+        err_bytes: bytes = b""
+        while True:
             try:
-                # 第一步：计数（违规总数）
-                cursor = conn.execute(build_count_sql(sql_text))
-                count_row = cursor.fetchone()
-                count_value = int(count_row[0]) if count_row else 0
-
-                sample: list[dict[str, Any]] = []
-                if count_value > 0:
-                    # 第二步：仅在确有违规时取前 N 行明细，共享同一 deadline
-                    sample_cursor = conn.execute(
-                        build_sample_sql(sql_text, sample_limit)
-                    )
-                    sample = _rows_to_dicts(
-                        sample_cursor, sample_cursor.fetchall()
-                    )
-
-                # 正常完成；若看门狗已记录中断原因，则不能当作正常结果
-                with bundle.state_lock:
-                    if bundle.result.reason is None:
-                        bundle.finished = True
-                        bundle.normal_payload = (count_value, sample)
-            except BaseException as exc:  # 含 OperationalError(interrupted)
-                worker_error.append(exc)
-
-        thread = threading.Thread(
-            target=worker, name="rule-worker", daemon=True
-        )
-        thread.start()
-        watcher = threading.Thread(
-            target=_watchdog,
-            args=(bundle, thread),
-            name="rule-watchdog",
-            daemon=True,
-        )
-        watcher.start()
-        thread.join()
-        watcher.join(timeout=1.0)
-
-        elapsed_ms = int((time.monotonic() - started) * 1000)
-
-        if worker_error:
-            exc = worker_error[0]
-            if isinstance(exc, sqlite3.OperationalError) and (
-                "interrupt" in str(exc).lower()
-            ):
-                status = _classify_interrupt_error(bundle)
-                if status == storage.RULE_CANCELLED:
-                    return RuleOutcome(
-                        status=status,
-                        error_message="批次被取消，规则计算已中止",
-                        elapsed_ms=elapsed_ms,
-                        cancelled=True,
-                    )
-                return RuleOutcome(
-                    status=status,
-                    error_message=(
-                        f"规则超过 {timeout_seconds:.0f} 秒时限，"
-                        "已调用 sqlite3 interrupt 中止实际计算；超时不算通过"
-                    ),
-                    elapsed_ms=elapsed_ms,
-                    timed_out=True,
+                out_bytes, err_bytes = proc.communicate(
+                    timeout=_POLL_INTERVAL_SECONDS
                 )
-            # 只读库上的写尝试、SQL 语法/ schema 错误等
-            return RuleOutcome(
-                status=storage.RULE_ERROR,
-                error_message=f"{type(exc).__name__}: {exc}",
-                elapsed_ms=elapsed_ms,
-            )
+                break  # 子进程已退出且输出收齐
+            except subprocess.TimeoutExpired:
+                if cancel_event.is_set():
+                    reason = "cancelled"
+                    break
+                if time.monotonic() >= deadline:
+                    reason = "timeout"
+                    break
 
-        # 无异常：确认看门狗没有在临界时刻判定超时 / 取消
-        with bundle.state_lock:
-            reason = bundle.result.reason
-            normal = bundle.normal_payload
-        if reason is not None or normal is None:
-            status = (
-                storage.RULE_CANCELLED
-                if (reason == "cancelled" or cancel_event.is_set())
-                else storage.RULE_TIMEOUT
-            )
-            if status == storage.RULE_CANCELLED:
+        if reason is not None:
+            # 到点 / 取消：立即 SIGKILL，回收进程，不等待 GLOB 等内置函数自然结束
+            _kill_and_reap(proc)
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            if reason == "cancelled":
                 return RuleOutcome(
-                    status=status,
-                    error_message="批次被取消，规则结果作废",
+                    status=storage.RULE_CANCELLED,
+                    error_message=(
+                        "批次被取消，规则工作进程已终止（SIGKILL），"
+                        "实际计算停止且资源已回收"
+                    ),
                     elapsed_ms=elapsed_ms,
                     cancelled=True,
                 )
             return RuleOutcome(
-                status=status,
+                status=storage.RULE_TIMEOUT,
                 error_message=(
-                    f"规则达到 {timeout_seconds:.0f} 秒时限被中断；超时不算通过"
+                    f"规则超过 {timeout_seconds:.0f} 秒时限，工作进程已被强制终止"
+                    "（SIGKILL），实际计算停止且资源已回收；超时不算通过"
                 ),
                 elapsed_ms=elapsed_ms,
                 timed_out=True,
             )
 
-        count_value, sample = normal
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+
+        # 临界复核（fail-closed）：子进程虽正常退出，但输出到手时
+        # 取消已受理或时限已过，结果一律作废，绝不放行
+        if cancel_event.is_set():
+            return RuleOutcome(
+                status=storage.RULE_CANCELLED,
+                error_message="批次被取消，迟到的规则结果作废",
+                elapsed_ms=elapsed_ms,
+                cancelled=True,
+            )
+        if time.monotonic() > deadline:
+            return RuleOutcome(
+                status=storage.RULE_TIMEOUT,
+                error_message=(
+                    f"规则结果在 {timeout_seconds:.0f} 秒时限后才产出，"
+                    "按超时处理；超时不算通过"
+                ),
+                elapsed_ms=elapsed_ms,
+                timed_out=True,
+            )
+
+        if proc.returncode != 0:
+            detail = err_bytes.decode("utf-8", "replace").strip()
+            return RuleOutcome(
+                status=storage.RULE_ERROR,
+                error_message=(
+                    f"规则工作进程异常退出(code={proc.returncode}): "
+                    f"{detail[:500] or '无错误输出'}"
+                ),
+                elapsed_ms=elapsed_ms,
+            )
+
+        try:
+            payload = json.loads(out_bytes.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            return RuleOutcome(
+                status=storage.RULE_ERROR,
+                error_message=f"规则工作进程输出无法解析: {exc}",
+                elapsed_ms=elapsed_ms,
+            )
+        if not isinstance(payload, dict) or "ok" not in payload:
+            return RuleOutcome(
+                status=storage.RULE_ERROR,
+                error_message="规则工作进程输出格式非法",
+                elapsed_ms=elapsed_ms,
+            )
+        if not payload["ok"]:
+            return RuleOutcome(
+                status=storage.RULE_ERROR,
+                error_message=(
+                    f"{payload.get('error_type', 'Error')}: "
+                    f"{payload.get('error', '')}"
+                ),
+                elapsed_ms=elapsed_ms,
+            )
+
+        count_value = int(payload.get("count") or 0)
+        sample = payload.get("sample") or []
         if count_value == 0:
             return RuleOutcome(
                 status=storage.RULE_PASSED,
@@ -318,9 +380,7 @@ def execute_rule(
             elapsed_ms=elapsed_ms,
         )
     finally:
-        if conn is not None:
-            try:
-                conn.set_progress_handler(None, 0)
-                conn.close()
-            except sqlite3.Error:
-                pass
+        # 兜底：任何路径返回前，绝不留下仍在运行的子进程
+        if proc is not None and proc.poll() is None:
+            _kill_and_reap(proc)
+        _remove_quietly(job_path)

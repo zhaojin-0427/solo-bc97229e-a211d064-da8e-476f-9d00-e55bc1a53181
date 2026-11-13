@@ -6,7 +6,7 @@ services:
     ports:
       - "8000:8000"
     environment:
-      # 每条规则的计算时限（秒），到点 interrupt 真正停止计算
+      # 每条规则的计算时限（秒），到点 SIGKILL 规则工作子进程，真正停止计算
       QUERY_TIMEOUT_SECONDS: "5"
       SAMPLE_ROW_LIMIT: "20"
       MAX_RULES_PER_BATCH: "100"

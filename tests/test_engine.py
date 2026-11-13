@@ -6,12 +6,16 @@
 
 覆盖：
 1. 零行查询 -> passed；有行 -> violations，计数正确且只保留前 20 行；
-2. 慢查询在时限内被 sqlite3 interrupt 真正中止 -> timeout，不算通过；
+2. 慢查询在时限内被真正中止 -> timeout，不算通过；
 3. 取消事件触发 -> cancelled，实际计算停止；
 4. 只读连接拒绝任何写操作（上传库不被修改）；
 5. 重启恢复：queued/running 批次标记 interrupted，规则同样标记；
 6. 取消后迟到结果不会把规则改写成完成；
-7. 取消注册表的基本行为。
+7. 取消注册表的基本行为；
+8. 回归：长文本 GLOB（50 万个 a × 星号+2 万个 a+b 模式）在 SQLite 内置
+   函数内部卡住，interrupt/progress handler 均失效——子进程隔离 + SIGKILL
+   必须在时限/取消时真正停止计算并回收资源，同批后续规则不必等待；
+9. 正常 GLOB 查询不被拒绝，计数/通过语义不变。
 """
 from __future__ import annotations
 
@@ -72,6 +76,38 @@ def make_fixture_db(dir_: Path) -> Path:
             "INSERT INTO visits(subject_id, visited_on) VALUES (?,?)",
             ("S2", f"2025-11-{1 + (i % 28):02d}"),
         )
+    conn.commit()
+    conn.close()
+    return p
+
+
+# 回归用例的固定输入：enrolled_on 含 50 万个 a；
+# GLOB 模式 = 星号 + 2 万个 a + 末尾 b。该匹配是 SQLite 内置函数里的
+# 单次 C 级调用（实测自然完成约 22 秒），期间 interrupt 与 progress
+# handler 都不会生效——只有子进程 SIGKILL 能真正停止它。
+GLOB_TEXT_LEN = 500_000
+GLOB_PATTERN = "*" + "a" * 20_000 + "b"
+GLOB_STALL_SQL = (
+    "SELECT id FROM subjects WHERE enrolled_on GLOB '" + GLOB_PATTERN + "'"
+)
+
+
+def make_glob_db(dir_: Path) -> Path:
+    p = dir_ / "glob.db"
+    conn = sqlite3.connect(p)
+    conn.executescript(
+        """
+        CREATE TABLE subjects(id TEXT PRIMARY KEY, enrolled_on TEXT);
+        CREATE TABLE visits(id INTEGER PRIMARY KEY, subject_id TEXT, visited_on TEXT);
+        """
+    )
+    conn.execute(
+        "INSERT INTO subjects VALUES ('LONG', ?)", ("a" * GLOB_TEXT_LEN,)
+    )
+    conn.execute("INSERT INTO subjects VALUES ('S1', '2026-01-01')")
+    conn.execute(
+        "INSERT INTO visits(subject_id, visited_on) VALUES ('S1','2026-02-01')"
+    )
     conn.commit()
     conn.close()
     return p
@@ -142,6 +178,72 @@ def test_cancel_stops_computation(db: Path) -> None:
     check(out is not None and out.status == storage.RULE_CANCELLED,
           f"取消判定 cancelled（实际 {None if out is None else out.status}）")
     check(elapsed < 3.0, f"取消后快速中止（{elapsed:.2f}s），未等 30 秒预算")
+
+
+def test_glob_stall_timeout_kills_computation(db: Path) -> None:
+    print("== 回归：长文本 GLOB 卡在内置函数，超时 SIGKILL 真正停止计算 ==")
+    t0 = time.monotonic()
+    out = execute_rule(str(db), GLOB_STALL_SQL, threading.Event(), timeout_seconds=2.0)
+    elapsed = time.monotonic() - t0
+    check(out.status == storage.RULE_TIMEOUT,
+          f"GLOB 长匹配判定 timeout（实际 {out.status}）")
+    check(out.timed_out and out.violation_count is None,
+          "超时无违规计数，不可放行")
+    # 自然完成约 22 秒；若未真正杀死子进程，这里必然拖到自然结束
+    check(elapsed < 6.0,
+          f"约 2 秒预算内强制中止（实际 {elapsed:.2f}s），未等 GLOB 自然结束")
+    check("终止" in (out.error_message or "") or "时限" in (out.error_message or ""),
+          "错误信息说明已强制终止")
+
+    # 计算与资源已回收：紧随其后的下一条规则应立即执行，不被残留计算拖住
+    t1 = time.monotonic()
+    out2 = execute_rule(str(db), "SELECT id FROM subjects WHERE 1 = 0",
+                        threading.Event(), timeout_seconds=5)
+    follow = time.monotonic() - t1
+    check(out2.status == storage.RULE_PASSED, "后续规则正常判定 passed")
+    check(follow < 3.0, f"后续规则未被残留计算阻塞（实际 {follow:.2f}s）")
+
+
+def test_glob_stall_cancel_kills_computation(db: Path) -> None:
+    print("== 回归：GLOB 运行中取消，子进程被杀死，计算真正停止 ==")
+    event = threading.Event()
+    holder: dict = {}
+
+    def run() -> None:
+        holder["out"] = execute_rule(
+            str(db), GLOB_STALL_SQL, event, timeout_seconds=60.0
+        )
+
+    th = threading.Thread(target=run)
+    t0 = time.monotonic()
+    th.start()
+    time.sleep(0.5)
+    event.set()
+    th.join(timeout=8.0)
+    elapsed = time.monotonic() - t0
+    check(not th.is_alive(), "取消后执行真正结束（子进程已回收）")
+    out = holder.get("out")
+    check(out is not None and out.status == storage.RULE_CANCELLED,
+          f"取消判定 cancelled（实际 {None if out is None else out.status}）")
+    check(elapsed < 6.0,
+          f"取消后快速中止（{elapsed:.2f}s），未等 GLOB 自然结束（约 22 秒）")
+
+
+def test_glob_normal_query_not_rejected(db: Path) -> None:
+    print("== 回归：正常 GLOB 查询不被拒绝，计数/通过语义不变 ==")
+    out = execute_rule(str(db),
+                       "SELECT id FROM subjects WHERE enrolled_on GLOB '2026-*'",
+                       threading.Event(), timeout_seconds=5)
+    check(out.status == storage.RULE_VIOLATIONS,
+          f"短 GLOB 正常执行并命中 1 行（实际 {out.status}）")
+    check(out.violation_count == 1, f"计数正确（实际 {out.violation_count}）")
+    check(out.sample_rows and out.sample_rows[0]["id"] == "S1", "明细带列名")
+
+    out2 = execute_rule(str(db),
+                        "SELECT id FROM subjects WHERE enrolled_on GLOB '2099-*'",
+                        threading.Event(), timeout_seconds=5)
+    check(out2.status == storage.RULE_PASSED and out2.violation_count == 0,
+          "零行 GLOB 判定 passed")
 
 
 def test_readonly_never_writes(db: Path) -> None:
@@ -245,10 +347,14 @@ def test_late_result_guard(db: Path) -> None:
 def main() -> int:
     work = Path(tempfile.mkdtemp(prefix="ctms-cases-", dir=str(_TMP)))
     db = make_fixture_db(work)
+    glob_db = make_glob_db(work)
     try:
         test_pass_and_violations(db)
         test_timeout_interrupts_computation(db)
         test_cancel_stops_computation(db)
+        test_glob_stall_timeout_kills_computation(glob_db)
+        test_glob_stall_cancel_kills_computation(glob_db)
+        test_glob_normal_query_not_rejected(glob_db)
         test_readonly_never_writes(db)
         test_persistence_and_restart()
         test_cancel_registry()

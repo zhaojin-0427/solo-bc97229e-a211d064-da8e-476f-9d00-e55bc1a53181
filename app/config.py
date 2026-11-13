@@ -15,7 +15,7 @@ def _int(name: str, default: int) -> int:
 # 数据根目录：上传库副本、控制库（报告持久化）都放这里，挂载为 Docker volume
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data")).resolve()
 
-# 每条规则 SQL 的计算时限（秒）。届时调用 sqlite3 interrupt 真正停止计算。
+# 每条规则 SQL 的计算时限（秒）。届时父进程 SIGKILL 规则工作子进程，真正停止计算。
 QUERY_TIMEOUT_SECONDS = _int("QUERY_TIMEOUT_SECONDS", 5)
 
 # 报告中每条规则保留的违规明细行数
